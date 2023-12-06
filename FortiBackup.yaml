@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudFormation template to Auto Backup FotiGate Configration 
+  'FotiGateBackup'
+Parameters:
+  VpcId:
+    Type: String
+    Description: 'VPC ID of The Firewall Instances'
+  RouteTableId:
+    Type: String
+    Description: 'Associated Route Table ID of the Subnet'
+  SubnetId:
+    Type: String
+    Description: 'Subnet ID To be Deployed At (Subnet ID which the Lambda will be deployed At)'
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: 'API Key for FortiGate'
+  IPAddresses:
+    Type: String
+    Description: 'Comma-separated list of IP addresses'
+
+Resources:
+  FortigateBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'fortigate-backup-${AWS::AccountId}-${AWS::Region}'
+
+  FortigateSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: 'FortigateApiKey'
+      Description: 'API Key for FortiGate'
+      SecretString: !Ref ApiKey
+
+  FortiGateBackupLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: FortiGateBackup
+      Runtime: python3.11
+      Handler: "index.lambda_handler"
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from datetime import datetime
+          import urllib3
+          
+          # Suppress only the InsecureRequestWarning
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+          
+          secret_arn = os.environ['SECRET_ARN']
+          IP_Address = os.environ['IP_ADDRESS']
+          bucket_name = os.environ['BUCKET_NAME']
+          
+          # Split the comma-separated string into a list
+          IP_Addresses = IP_Address.split(',')
+          
+          def get_secret(secret_arn):
+              session = boto3.session.Session()
+              client = session.client(service_name='secretsmanager')
+          
+              get_secret_value_response = client.get_secret_value(SecretId=secret_arn)
+              secret = get_secret_value_response['SecretString']
+          
+              return secret
+          
+          def lambda_handler(event, context):
+              api_key = get_secret(secret_arn)
+          
+              for ip_address in IP_Addresses:
+                  api_url = f'https://{ip_address}/api/v2/monitor/system/config/backup?scope=global&access_token={api_key}'
+          
+                  # Disable SSL verification
+                  http = urllib3.PoolManager(cert_reqs='CERT_NONE', assert_hostname=False)
+                  response = http.request('GET', api_url, retries=False, timeout=urllib3.Timeout(connect=2.0, read=15.0))
+          
+                  file_name = f"/tmp/{ip_address}_{datetime.now().strftime('%d-%m-%Y')}.conf"  # Using /tmp directory
+          
+                  # Write the backup to a file
+                  with open(file_name, 'wb') as f:
+                      f.write(response.data)
+          
+                  # Upload the file to S3
+                  s3 = boto3.client('s3')
+                  s3.upload_file(file_name, bucket_name, file_name.split("/")[-1])
+          
+                  print(f"{ip_address} has been Backed Up Successfully")
+          
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Backup completed successfully!')
+              }
+
+      Role: !GetAtt FortiGateBackupLambdaFunctionRole.Arn
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref FortiGateBackupLambdaFunctionSecurityGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref FortigateSecret
+          IP_ADDRESS: !Ref IPAddresses
+          BUCKET_NAME: !Ref FortigateBucket
+  FortiGateBackupLambdaFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: FortiGateBackup-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref FortiGateBackupPolicy
+
+  FortiGateBackupLambdaFunctionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: FortiGateBackupLambdaFunctionSecurityGroup
+      VpcId: !Ref VpcId
+      GroupDescription: 'Security group for the FortiGate Backup Lambda Function'
+      SecurityGroupIngress:
+        - CidrIp: '0.0.0.0/0'
+          IpProtocol: '-1'
+      SecurityGroupEgress:
+        - CidrIp: '0.0.0.0/0'
+          IpProtocol: '-1'
+
+  FortiGateBackupPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: FortiGateBackup-Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: VisualEditor0
+            Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:DescribeSecret'
+            Resource:
+              - Fn::Sub: 'arn:aws:s3:::${FortigateBucket}/*'
+              - !Ref FortigateSecret
+          - Sid: VisualEditor1
+            Effect: Allow
+            Action:
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DeleteNetworkInterface'
+            Resource: '*'
+
+
+
+  FortiGateBackupRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: 'FortiGateBackupRule'
+      Description: 'Daily trigger at 2 AM UAE time'
+      ScheduleExpression: 'cron(0 22 * * ? *)'  # 2 AM UAE time
+      State: 'ENABLED'
+      Targets:
+        - Id: FortiGateBackupRuleTarget
+          Arn: !GetAtt FortiGateBackupLambdaFunction.Arn
+
+  EventLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref FortiGateBackupLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FortiGateBackupRule.Arn
+
+  FortiGateS3GatewayEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref RouteTableId
+
+  FortiGateSecretsManagerVPCEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref FortiGateBackupLambdaFunctionSecurityGroup
+      PrivateDnsEnabled: true
